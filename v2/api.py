@@ -76,44 +76,51 @@ def _normalize_state_entry(entry: Any) -> Any:
     return entry, None
 
 
+from itertools import zip_longest
+from typing import List, Any, Dict
+
 def _compute_state_diff(prev_state: List[Any], new_state: List[Any]) -> List[Dict[str, Any]]:
+    # Early return if states are identical (before normalization)
+    if prev_state == new_state:
+        return []
+    
+    # Normalize entries
     prev_norm = [_normalize_state_entry(e) for e in prev_state]
     new_norm = [_normalize_state_entry(e) for e in new_state]
-
+    
+    # Early return if normalized states are identical
     if prev_norm == new_norm:
         return []
-
-    len_prev = len(prev_norm)
-    len_new = len(new_norm)
-
-    max_len = max(len_prev, len_new)
+    
     changes: List[Dict[str, Any]] = []
-
-    for idx in range(max_len):
-        prev_entry = prev_norm[idx] if idx < len_prev else (None, None)
-        new_entry = new_norm[idx] if idx < len_new else (None, None)
-
-        if prev_entry == new_entry:
-            continue
-
+    
+    # Use zip_longest to handle different length lists
+    for idx, (prev_entry, new_entry) in enumerate(zip_longest(prev_norm, new_norm, fillvalue=(None, None))):
         prev_token = prev_entry[0]
         new_token = new_entry[0]
-
-        # Handle pure deletions (new token missing) by signalling replacement with empty text
+        
+        # Skip unchanged entries
+        if prev_token == new_token:
+            continue
+        
+        # Handle deletions (new token is None)
         if new_token is None:
             if prev_token and prev_token != "[MASK]":
                 changes.append({"position": idx, "text": "", "replace_length": 1})
             continue
-
+        
+        # Skip invalid new tokens
         if not new_token or new_token == "[MASK]":
             continue
-
-        change: Dict[str, Any] = {"position": idx, "text": new_token}
+        
+        # Handle insertions and replacements
+        change = {"position": idx, "text": new_token}
         if prev_token is not None:
             change["replace_length"] = 1
         changes.append(change)
-
+    
     return changes
+
 
 
 def _format_messages(messages: List[ChatCompletionMessage]) -> List[Dict[str, str]]:
@@ -132,6 +139,10 @@ def _stream_fast_dllm(
     top_p = request.top_p
 
     block_length = request.extra_body.diffusion_block_length if request.extra_body else 32
+    if block_length > 32:
+        block_length = 32
+    if block_length < 4:
+        block_length = 4
     threshold = request.extra_body.diffusion_threshold if request.extra_body else 0.95
 
     previous_state: List[Any] = []
