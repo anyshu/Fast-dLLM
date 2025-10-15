@@ -62,7 +62,7 @@ class ChatCompletionResponse(BaseModel):
     model: str
     system_fingerprint: str
     choices: List[ChatCompletionChoice]
-    usage: Dict[str, int]
+    usage: Dict[str, Any]
 
 
 def _generate_completion_id() -> str:
@@ -147,8 +147,11 @@ def _stream_fast_dllm(
 
     previous_state: List[Any] = []
     step_index = 0
-    generation_start = time.time()
+    diffusion_start = time.time()
     completion_tokens = 0
+    first_item = True
+    prefill_time = 0.0
+    generate_time = 0.0
 
     try:
         generator = generate_response_with_visualization_fast_dllm(
@@ -164,8 +167,12 @@ def _stream_fast_dllm(
         )
 
         for item in generator:
-            print(f"item: {type(item)}")
+            # print(f"item: {type(item)}")
             if isinstance(item, list):
+                if first_item:
+                    prefill_time = time.time() - diffusion_start
+                    generate_start = time.time()
+                    first_item = False
                 changes = _compute_state_diff(previous_state, item)
                 if not changes:
                     previous_state = list(item)
@@ -173,7 +180,10 @@ def _stream_fast_dllm(
 
                 previous_state = list(item)
                 step_index += 1
-                print(f"item, step_index: {step_index}, changes: {changes}")
+                # print(f"item, step_index: {step_index}, changes: {changes}")
+
+                # current_text = "".join([e[0] if isinstance(e, tuple) and e[0] else str(e) if e else "" for e in previous_state if e and (isinstance(e, tuple) and e[0] != "[MASK]" or str(e) != "[MASK]")])
+                # completion_tokens = len(tokenizer.encode(current_text, add_special_tokens=False))
 
                 delta = {
                     "content": changes,
@@ -194,24 +204,33 @@ def _stream_fast_dllm(
                             "finish_reason": None,
                         }
                     ],
+                    # "usage": {
+                    #     "prompt_tokens": prompt_tokens,
+                    #     "completion_tokens": completion_tokens,
+                    #     "total_tokens": prompt_tokens + completion_tokens,
+                    # },
                 }
 
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
             else:
+                generate_time = time.time() - generate_start
                 completion_tokens = len(tokenizer.encode(item, add_special_tokens=False))
-                generation_time = time.time() - generation_start
-                generation_time_str = f"{generation_time:.2f}s"
+                generation_time = prefill_time + generate_time
+                generation_time_str = f"{generation_time:.3f}s"
                 throughput = completion_tokens / generation_time if generation_time > 0 else 0
-                throughput_str = f"{throughput:.2f} tokens/s"
+                throughput_str = f"{throughput:.3f} tokens/s"
                 total_tokens = prompt_tokens + completion_tokens
                 print(
                     "[Fast-dLLM Summary] "
                     f"prompt_tokens={prompt_tokens}, "
                     f"completion_tokens={completion_tokens}, "
                     f"total_tokens={total_tokens}, "
+                    f"prefill_time={prefill_time:.3f}s, "
+                    f"generate_time={generate_time:.3f}s, "
                     f"generation_time={generation_time_str}, "
-                    f"throughput={throughput_str}"
+                    f"throughput={throughput_str}",
+                    flush=True
                 )
                 break
 
@@ -232,6 +251,14 @@ def _stream_fast_dllm(
                     "finish_reason": "stop",
                 }
             ],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+                "prefill_time": float(f"{prefill_time:.3f}"),
+                "generate_time": float(f"{generate_time:.3f}"),
+                "time_cost": float(f"{generation_time:.3f}")
+            },
         }
 
         yield f"data: {json.dumps(completion_chunk, ensure_ascii=False)}\n\n"
@@ -260,6 +287,9 @@ def _run_fast_dllm(
     threshold = request.extra_body.diffusion_threshold if request.extra_body else 0.95
 
     start_time = time.time()
+    first_item = True
+    prefill_time = 0.0
+    generate_time = 0.0
     generator = generate_response_with_visualization_fast_dllm(
         model_accelerated,
         tokenizer,
@@ -275,12 +305,17 @@ def _run_fast_dllm(
     final_text = ""
     for item in generator:
         if isinstance(item, list):
+            if first_item:
+                prefill_time = time.time() - start_time
+                generate_start = time.time()
+                first_item = False
             continue
         final_text = item
+        generate_time = time.time() - generate_start
         break
 
-    generation_time = time.time() - start_time
-    return final_text, generation_time
+    generation_time = prefill_time + generate_time
+    return final_text, generation_time, prefill_time, generate_time
 
 
 @app.get("/health")
@@ -321,7 +356,7 @@ def chat_completions(request: ChatCompletionRequest):
         return StreamingResponse(event_stream(), media_type=STREAM_MEDIA_TYPE)
 
     with generation_lock:
-        final_text, generation_time = _run_fast_dllm(request, formatted_messages)
+        final_text, generation_time, prefill_time, generate_time = _run_fast_dllm(request, formatted_messages)
 
     completion_tokens = len(tokenizer.encode(final_text, add_special_tokens=False))
     generation_time_str = f"{generation_time:.2f}s"
@@ -334,6 +369,8 @@ def chat_completions(request: ChatCompletionRequest):
         f"prompt_tokens={prompt_tokens}, "
         f"completion_tokens={completion_tokens}, "
         f"total_tokens={total_tokens}, "
+        f"prefill_time={prefill_time:.2f}s, "
+        f"generate_time={generate_time:.2f}s, "
         f"generation_time={generation_time_str}, "
         f"throughput={throughput_str}"
     )
@@ -355,6 +392,9 @@ def chat_completions(request: ChatCompletionRequest):
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
+            "prefill_time": float(f"{prefill_time:.3f}"),
+            "generate_time": float(f"{generate_time:.3f}"),
+            "time_cost": float(f"{generation_time:.3f}"),
         },
     )
 
