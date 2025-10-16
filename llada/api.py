@@ -9,6 +9,8 @@ import time
 import uuid
 import asyncio
 import traceback
+import contextlib
+import os
 from typing import List, Dict, Any, Optional, AsyncGenerator, Generator
 from dataclasses import dataclass
 from datetime import datetime
@@ -82,7 +84,7 @@ class Message(BaseModel):
 class ExtraBody(BaseModel):
     diffusion_steps: int = Field(default=128, description="Number of diffusion denoising steps")
     diffusion_remasking: str = Field(default="low_confidence", description="Diffusion remasking algorithm")
-    diffusion_block_length: int = Field(default=32, description="Block length for semi-autoregressive generation")
+    diffusion_block_length: int = Field(default=128, description="Block length for semi-autoregressive generation")
     diffusion_threshold: float = Field(default=0.9, description="Confidence threshold for token selection")
 
 class ChatCompletionRequest(BaseModel):
@@ -108,6 +110,15 @@ class Choice(BaseModel):
     message: Optional[Dict[str, Any]] = Field(default=None, description="Complete message for non-streaming")
     finish_reason: Optional[str] = Field(default=None, description="Reason for finishing")
 
+class UsageInfo(BaseModel):
+    prompt_tokens: int = Field(..., description="Number of tokens in the prompt")
+    completion_tokens: int = Field(..., description="Number of tokens in the completion")
+    total_tokens: int = Field(..., description="Total number of tokens")
+    prefill_time: float = Field(..., description="Time spent on prefill in seconds")
+    generate_time: float = Field(..., description="Time spent on generation in seconds")
+    time_cost: float = Field(..., description="Total generation time in seconds")
+    throughput: float = Field(..., description="Tokens per second")
+
 class ChatCompletionResponse(BaseModel):
     id: str = Field(..., description="Unique identifier for the completion")
     object: str = Field(default="chat.completion", description="Object type")
@@ -115,6 +126,7 @@ class ChatCompletionResponse(BaseModel):
     model: str = Field(..., description="Model used for completion")
     system_fingerprint: str = Field(default="llada-diffusion-api", description="System fingerprint")
     choices: List[Choice] = Field(..., description="List of completion choices")
+    usage: Optional[UsageInfo] = Field(default=None, description="Token usage information")
 
 # Initialize FastAPI app
 app = FastAPI(title="LLaDA Diffusion API", version="1.0.0")
@@ -291,7 +303,7 @@ async def stream_chat_completion(request: ChatCompletionRequest) -> AsyncGenerat
         remasking = extra.diffusion_remasking
         if remasking not in ["low_confidence", "random"]:
             remasking = "low_confidence"
-        block_length = extra.diffusion_block_length
+        block_length = max(1, extra.diffusion_block_length)
         threshold = extra.diffusion_threshold
         
         print(f"Stream parameters: gen_length={gen_length}, steps={steps}, temperature={temperature}")
@@ -300,8 +312,19 @@ async def stream_chat_completion(request: ChatCompletionRequest) -> AsyncGenerat
         # Measure preprocessing time
         prep_start = time.time()
         
+        prompt_chat_input = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        prompt_encoding = tokenizer(prompt_chat_input, add_special_tokens=False)
+        prompt_inputs = prompt_encoding['input_ids']
+        if isinstance(prompt_inputs, list) and prompt_inputs and isinstance(prompt_inputs[0], list):
+            prompt_inputs = prompt_inputs[0]
+        prompt_tokens = len(prompt_inputs)
+        prompt_cache = {
+            "chat_input": prompt_chat_input,
+            "input_ids": prompt_inputs
+        }
+        
         # Generate response with streaming
-        previous_state = {}
+        generated_tokens: Dict[int, str] = {}
         current_step = 0
         generation_start_time = time.time()
         
@@ -324,6 +347,12 @@ async def stream_chat_completion(request: ChatCompletionRequest) -> AsyncGenerat
                 
                 current_step += 1
                 
+                for item in step_data.get("content", []):
+                    position = item.get("position")
+                    text = item.get("text", "")
+                    if position is not None:
+                        generated_tokens[position] = text
+                        
                 response = ChatCompletionResponse(
                     id=completion_id,
                     object="chat.completion.chunk",
@@ -343,16 +372,38 @@ async def stream_chat_completion(request: ChatCompletionRequest) -> AsyncGenerat
         total_generation_time = time.time() - generation_start_time
         total_time = time.time() - total_start_time
         
-        print(f"=== Stream Generation Complete ===")
-        print(f"Total request time: {total_time:.2f}s")
-        print(f"Generation time: {total_generation_time:.2f}s")
-        print(f"Time to first token: {first_token_time:.3f}s" if first_token_time else "No tokens generated")
-        print(f"Total steps: {current_step}")
-        if current_step > 0:
-            print(f"Average time per step: {total_generation_time/current_step:.3f}s")
-        print(f"===================================")
+        # Calculate token statistics
+        sorted_tokens = [generated_tokens[idx] for idx in sorted(generated_tokens)]
+        final_text = "".join(sorted_tokens)
+        completion_tokens = len(tokenizer.encode(final_text, add_special_tokens=False))
+        total_tokens = prompt_tokens + completion_tokens
         
-        # Send final completion message
+        prefill_time = first_token_time if first_token_time else 0
+        generate_time = total_generation_time - prefill_time
+        throughput = completion_tokens / total_generation_time if total_generation_time > 0 else 0
+        
+        # print(f"=== Stream Generation Complete ===\n"
+        #     f"Total request time: {total_time:.2f}s\n"
+        #     f"Generation time: {total_generation_time:.2f}s\n"
+        #     f"{f'Time to first token: {first_token_time:.3f}s' if first_token_time else 'No tokens generated'}\n"
+        #     f"Total steps: {current_step}\n"
+        #     f"{f'Average time per step: {total_generation_time/current_step:.3f}s' if current_step > 0 else 'No steps completed'}\n"
+        #     f"===================================\n",
+        #     flush=True)
+        
+        print(
+            "[Fast-dLLM v1 Summary] "
+            f"prompt_tokens={prompt_tokens}, "
+            f"completion_tokens={completion_tokens}, "
+            f"total_tokens={total_tokens}, "
+            f"prefill_time={prefill_time:.3f}s, "
+            f"generate_time={generate_time:.3f}s, "
+            f"time_cost={total_generation_time:.3f}s, "
+            f"throughput={throughput:.3f} tokens/s",
+            flush=True
+        )
+        
+        # Send final completion message with usage info
         final_response = ChatCompletionResponse(
             id=completion_id,
             object="chat.completion.chunk",
@@ -362,7 +413,16 @@ async def stream_chat_completion(request: ChatCompletionRequest) -> AsyncGenerat
                 index=0,
                 delta=DiffusionDelta(content=[], step=current_step, max_step=steps),
                 finish_reason="stop"
-            )]
+            )],
+            usage=UsageInfo(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                prefill_time=prefill_time,
+                generate_time=generate_time,
+                time_cost=total_generation_time,
+                throughput=throughput
+            )
         )
         
         yield f"data: {final_response.model_dump_json()}\n\n"
@@ -439,6 +499,12 @@ async def chat_completions(request: ChatCompletionRequest):
             
             # Generate complete response
             print(f"=== Generating Non-streaming Response ===")
+            prompt_chat_input = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            prompt_encoding = tokenizer(prompt_chat_input, add_special_tokens=False)
+            prompt_inputs = prompt_encoding['input_ids']
+            if isinstance(prompt_inputs, list) and prompt_inputs and isinstance(prompt_inputs[0], list):
+                prompt_inputs = prompt_inputs[0]
+            prompt_tokens = len(prompt_inputs)
             generation_start = time.time()
             _, final_text = generate_response_with_visualization_cache_and_parallel(
                 model, tokenizer, device, messages,
@@ -449,12 +515,33 @@ async def chat_completions(request: ChatCompletionRequest):
             generation_time = time.time() - generation_start
             total_request_time = time.time() - request_start_time
             
-            print(f"=== Generation Complete ===")
-            print(f"Total request time: {total_request_time:.2f}s")
-            print(f"Generation time: {generation_time:.2f}s")
-            print(f"Overhead time: {total_request_time - generation_time:.3f}s")
-            print(f"Generated text: {final_text}")
-            print(f"==========================\n")
+            # Calculate token statistics
+            completion_tokens = len(tokenizer.encode(final_text, add_special_tokens=False))
+            total_tokens = prompt_tokens + completion_tokens
+            
+            # Estimate prefill and generate time (simplified for non-streaming)
+            prefill_time = generation_time * 0.1  # Rough estimate
+            generate_time = generation_time - prefill_time
+            throughput = completion_tokens / generation_time if generation_time > 0 else 0
+            
+            # print(f"=== Generation Complete ===")
+            # print(f"Total request time: {total_request_time:.2f}s")
+            # print(f"Generation time: {generation_time:.2f}s")
+            # print(f"Overhead time: {total_request_time - generation_time:.3f}s")
+            # print(f"Generated text: {final_text}")
+            # print(f"==========================\n")
+            
+            print(
+                "[Fast-dLLM Summary] "
+                f"prompt_tokens={prompt_tokens}, "
+                f"completion_tokens={completion_tokens}, "
+                f"total_tokens={total_tokens}, "
+                f"prefill_time={prefill_time:.3f}s, "
+                f"generate_time={generate_time:.3f}s, "
+                f"time_cost={generation_time:.3f}s, "
+                f"throughput={throughput:.3f} tokens/s",
+                flush=True
+            )
             
             response = ChatCompletionResponse(
                 id=completion_id,
@@ -465,7 +552,16 @@ async def chat_completions(request: ChatCompletionRequest):
                     index=0,
                     message={"role": "assistant", "content": final_text},
                     finish_reason="stop"
-                )]
+                )],
+                usage=UsageInfo(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                    prefill_time=prefill_time,
+                    generate_time=generate_time,
+                    time_cost=generation_time,
+                    throughput=throughput
+                )
             )
             
             print(f"=== Final Response ===")
