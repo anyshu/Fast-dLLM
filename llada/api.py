@@ -47,16 +47,18 @@ def load_model():
     if tokenizer is None or model is None:
         print("Loading LLaDA model...")
         start_time = time.time()
-        
+
+        # model_path = '/mnt/data/models/GSAI-ML/LLaDA-8B-Instruct'
+        model_path = '/mnt/data/models/inclusionAI/LLaDA2.0-mini-preview'
         # Load tokenizer
         tokenizer_start = time.time()
-        tokenizer = AutoTokenizer.from_pretrained('/mnt/data/models/GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         tokenizer_time = time.time() - tokenizer_start
         print(f"Tokenizer loaded in {tokenizer_time:.2f}s")
         
         # Load model
         model_start = time.time()
-        model = LLaDAModelLM.from_pretrained('/mnt/data/models/GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, 
+        model = LLaDAModelLM.from_pretrained(model_path, trust_remote_code=True, 
                                           torch_dtype=torch.bfloat16).to(device)
         model_time = time.time() - model_start
         print(f"Model loaded in {model_time:.2f}s")
